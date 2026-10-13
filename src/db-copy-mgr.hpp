@@ -11,8 +11,10 @@
  */
 
 #include <cassert>
+#include <iterator>
 #include <memory>
 #include <string>
+#include <string_view>
 
 #include "db-copy.hpp"
 #include "hex.hpp"
@@ -40,7 +42,8 @@ public:
             if (m_current) {
                 m_processor->send_command(std::move(m_current));
             }
-            m_current = db_cmd_copy_delete_t<DELETER>(table);
+            m_current = db_cmd_copy_delete_t<DELETER>(
+                table, m_processor->acquire_buffer());
         }
         m_committed = m_current.buffer.size();
     }
@@ -198,7 +201,8 @@ public:
      * Add a key (unescaped) and a numeric value to a hash column.
      *
      * Key must be string and come from a safe source because it will NOT be
-     * escaped! The value should be convertible using std::to_string.
+     * escaped! The value must be formattable with fmt's "{}" (any
+     * arithmetic type works).
      * A separator for the next pair is added at the end.
      *
      * This method is suitable to insert safe input, e.g. numeric OSM metadata
@@ -210,7 +214,8 @@ public:
         m_current.buffer += '"';
         m_current.buffer += k;
         m_current.buffer += "\"=>\"";
-        m_current.buffer += std::to_string(value);
+        fmt::format_to(std::back_inserter(m_current.buffer), FMT_STRING("{}"),
+                       value);
         m_current.buffer += "\",";
     }
 
@@ -237,6 +242,9 @@ public:
      */
     void add_hex_geom(std::string const &wkb)
     {
+        // The hex encoding doubles the size of the data. Reserve enough
+        // memory so that encode_hex() does not have to reallocate.
+        m_current.buffer.reserve(m_current.buffer.size() + 2 * wkb.size() + 64);
         util::encode_hex(wkb, &m_current.buffer);
         m_current.buffer += '\t';
     }
@@ -280,7 +288,8 @@ private:
     template <typename T>
     void add_value(T value)
     {
-        m_current.buffer += fmt::to_string(value);
+        fmt::format_to(std::back_inserter(m_current.buffer), FMT_STRING("{}"),
+                       value);
     }
 
     void add_value(std::string const &s) { add_value(s.c_str()); }
@@ -288,39 +297,39 @@ private:
     void add_value(char const *s)
     {
         assert(m_current);
-        for (char const *c = s; *c; ++c) {
-            switch (*c) {
-            case '"':
-                m_current.buffer += "\\\"";
-                break;
-            case '\\':
-                m_current.buffer += "\\\\";
-                break;
-            case '\n':
-                m_current.buffer += "\\n";
-                break;
-            case '\r':
-                m_current.buffer += "\\r";
-                break;
-            case '\t':
-                m_current.buffer += "\\t";
-                break;
-            default:
-                m_current.buffer += *c;
-                break;
-            }
-        }
+        escape_and_add(s, "\\\"", "\\\\");
     }
 
     void add_escaped_string(char const *s)
     {
-        for (char const *c = s; *c; ++c) {
-            switch (*c) {
+        escape_and_add(s, R"(\\")", R"(\\\\)");
+    }
+
+    /**
+     * Append str to the current buffer escaping all characters that need
+     * escaping for the COPY (or hstore) text format.
+     *
+     * Runs of characters not needing escaping are appended in one go.
+     * Double quote and backslash are escaped differently depending on the
+     * context, the caller passes the escape sequences to use for them.
+     */
+    void escape_and_add(std::string_view const str, char const *quote_escape,
+                        char const *backslash_escape)
+    {
+        std::size_t start = 0;
+        for (;;) {
+            auto const pos = str.find_first_of("\"\\\n\r\t", start);
+            if (pos == std::string_view::npos) {
+                m_current.buffer.append(str, start, std::string_view::npos);
+                break;
+            }
+            m_current.buffer.append(str, start, pos - start);
+            switch (str[pos]) {
             case '"':
-                m_current.buffer += R"(\\")";
+                m_current.buffer += quote_escape;
                 break;
             case '\\':
-                m_current.buffer += R"(\\\\)";
+                m_current.buffer += backslash_escape;
                 break;
             case '\n':
                 m_current.buffer += "\\n";
@@ -331,10 +340,8 @@ private:
             case '\t':
                 m_current.buffer += "\\t";
                 break;
-            default:
-                m_current.buffer += *c;
-                break;
             }
+            start = pos + 1;
         }
     }
 
