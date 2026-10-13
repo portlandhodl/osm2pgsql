@@ -281,6 +281,44 @@ void run_tile_gen(std::atomic_flag *error_flag,
     }
 }
 
+void run_create_tile_indexes(std::atomic_flag *error_flag,
+                             connection_params_t const &connection_params,
+                             std::vector<flex_table_t const *> *queue,
+                             std::mutex *mut, unsigned int n)
+{
+    try {
+        logger_t::init_thread(n);
+
+        pg_conn_t const db_connection{connection_params, "gen.index"};
+
+        while (true) {
+            flex_table_t const *table;
+            {
+                std::lock_guard<std::mutex> const guard{*mut};
+                if (queue->empty()) {
+                    break;
+                }
+                table = queue->back();
+                queue->pop_back();
+            }
+
+            log_info("Creating tile (x/y) index on table '{}'...",
+                     table->name());
+            auto const sql =
+                fmt::format("CREATE INDEX ON {} USING BTREE (x, y) {}",
+                            table->full_name(),
+                            tablespace_clause(table->index_tablespace()));
+            db_connection.exec(sql);
+        }
+    } catch (std::exception const &e) {
+        log_error("{}", e.what());
+        error_flag->test_and_set();
+    } catch (...) {
+        log_error("Unknown exception in index creation thread.");
+        error_flag->test_and_set();
+    }
+}
+
 class genproc_t
 {
 public:
@@ -638,17 +676,43 @@ void genproc_t::run()
     }
 
     if (!m_append) {
-        pg_conn_t const db_connection{m_connection_params, "gen.index"};
+        std::vector<flex_table_t const *> index_tables;
         for (auto const &table : m_tables) {
             if (table.id_type() == flex_table_index_type::tile &&
                 (table.always_build_id_index() || m_updatable)) {
+                index_tables.push_back(&table);
+            }
+        }
+
+        if (m_jobs == 1 || index_tables.size() <= 1) {
+            pg_conn_t const db_connection{m_connection_params, "gen.index"};
+            for (auto const *table : index_tables) {
                 log_info("Creating tile (x/y) index on table '{}'...",
-                         table.name());
+                         table->name());
                 auto const sql =
                     fmt::format("CREATE INDEX ON {} USING BTREE (x, y) {}",
-                                table.full_name(),
-                                tablespace_clause(table.index_tablespace()));
+                                table->full_name(),
+                                tablespace_clause(table->index_tablespace()));
                 db_connection.exec(sql);
+            }
+        } else {
+            std::mutex mut;
+            std::vector<std::thread> threads;
+            std::atomic_flag error_flag = ATOMIC_FLAG_INIT;
+            for (unsigned int n = 1;
+                 n <= std::min(m_jobs,
+                               static_cast<uint32_t>(index_tables.size()));
+                 ++n) {
+                threads.emplace_back(run_create_tile_indexes, &error_flag,
+                                     m_connection_params, &index_tables, &mut,
+                                     n);
+            }
+            for (auto &thread : threads) {
+                thread.join();
+            }
+            if (error_flag.test_and_set()) {
+                throw std::runtime_error{
+                    "Error in index creation thread. Stopping."};
             }
         }
     }
