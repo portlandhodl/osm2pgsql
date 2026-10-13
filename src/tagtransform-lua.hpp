@@ -42,7 +42,11 @@ private:
     constexpr static char const *const REL_MEM_FUNC =
         "filter_tags_relation_member";
 
-    void check_lua_function_exists(char const *func_name);
+    /**
+     * Check that the Lua function func_name exists and store a reference
+     * to it in the Lua registry. Returns the reference.
+     */
+    int get_lua_function_ref(char const *func_name);
 
     struct lua_state_deleter_t
     {
@@ -54,6 +58,18 @@ private:
     std::unique_ptr<lua_State, lua_state_deleter_t> m_lua_state;
 
     std::string const *m_lua_file;
+
+    /**
+     * References to the Lua transform functions in the Lua registry.
+     * The Lua state is owned by this object and lua_close() releases the
+     * registry including these references, so no explicit luaL_unref()
+     * is needed in the destructor.
+     */
+    int m_func_node = LUA_NOREF;
+    int m_func_way = LUA_NOREF;
+    int m_func_rel = LUA_NOREF;
+    int m_func_rel_mem = LUA_NOREF;
+
     bool m_extra_attributes;
 };
 

@@ -24,10 +24,10 @@ lua_tagtransform_t::lua_tagtransform_t(std::string const *tag_transform_script,
                         lua_tostring(lua_state(), -1));
     }
 
-    check_lua_function_exists(NODE_FUNC);
-    check_lua_function_exists(WAY_FUNC);
-    check_lua_function_exists(REL_FUNC);
-    check_lua_function_exists(REL_MEM_FUNC);
+    m_func_node = get_lua_function_ref(NODE_FUNC);
+    m_func_way = get_lua_function_ref(WAY_FUNC);
+    m_func_rel = get_lua_function_ref(REL_FUNC);
+    m_func_rel_mem = get_lua_function_ref(REL_MEM_FUNC);
 }
 
 std::unique_ptr<tagtransform_t> lua_tagtransform_t::clone() const
@@ -35,14 +35,14 @@ std::unique_ptr<tagtransform_t> lua_tagtransform_t::clone() const
     return std::make_unique<lua_tagtransform_t>(m_lua_file, m_extra_attributes);
 }
 
-void lua_tagtransform_t::check_lua_function_exists(char const *func_name)
+int lua_tagtransform_t::get_lua_function_ref(char const *func_name)
 {
     lua_getglobal(lua_state(), func_name);
     if (!lua_isfunction(lua_state(), -1)) {
         throw fmt_error("Tag transform style does not contain a function {}.",
                         func_name);
     }
-    lua_pop(lua_state(), 1);
+    return luaL_ref(lua_state(), LUA_REGISTRYINDEX);
 }
 
 namespace {
@@ -86,19 +86,22 @@ bool lua_tagtransform_t::filter_tags(osmium::OSMObject const &o, bool *polygon,
 {
     switch (o.type()) {
     case osmium::item_type::node:
-        lua_getglobal(lua_state(), NODE_FUNC);
+        lua_rawgeti(lua_state(), LUA_REGISTRYINDEX, m_func_node);
         break;
     case osmium::item_type::way:
-        lua_getglobal(lua_state(), WAY_FUNC);
+        lua_rawgeti(lua_state(), LUA_REGISTRYINDEX, m_func_way);
         break;
     case osmium::item_type::relation:
-        lua_getglobal(lua_state(), REL_FUNC);
+        lua_rawgeti(lua_state(), LUA_REGISTRYINDEX, m_func_rel);
         break;
     default:
         throw std::runtime_error{"Unknown OSM type."};
     }
 
-    lua_newtable(lua_state()); /* key value table */
+    /* key value table */
+    lua_createtable(lua_state(), 0,
+                    static_cast<int>(o.tags().size()) +
+                        (m_extra_attributes ? 5 : 0));
 
     lua_Integer sz = 0;
     for (auto const &t : o.tags()) {
@@ -108,14 +111,24 @@ bool lua_tagtransform_t::filter_tags(osmium::OSMObject const &o, bool *polygon,
         ++sz;
     }
     if (m_extra_attributes && o.version() > 0) {
-        taglist_t tags;
-        tags.add_attributes(o);
-        for (auto const &t : tags) {
-            luaX_pushstring(lua_state(), t.key);
-            luaX_pushstring(lua_state(), t.value);
-            lua_rawset(lua_state(), -3);
-            ++sz;
-        }
+        // Keys and value formats must match the taglist_t::add_attributes()
+        // function in osmtypes.hpp.
+        lua_pushliteral(lua_state(), "osm_user");
+        luaX_pushstring(lua_state(), o.user());
+        lua_rawset(lua_state(), -3);
+        lua_pushliteral(lua_state(), "osm_uid");
+        luaX_pushstring(lua_state(), std::to_string(o.uid()));
+        lua_rawset(lua_state(), -3);
+        lua_pushliteral(lua_state(), "osm_version");
+        luaX_pushstring(lua_state(), std::to_string(o.version()));
+        lua_rawset(lua_state(), -3);
+        lua_pushliteral(lua_state(), "osm_timestamp");
+        luaX_pushstring(lua_state(), o.timestamp().to_iso());
+        lua_rawset(lua_state(), -3);
+        lua_pushliteral(lua_state(), "osm_changeset");
+        luaX_pushstring(lua_state(), std::to_string(o.changeset()));
+        lua_rawset(lua_state(), -3);
+        sz += 5;
     }
 
     lua_pushinteger(lua_state(), sz);
@@ -153,7 +166,7 @@ bool lua_tagtransform_t::filter_rel_member_tags(
     bool *roads, taglist_t *out_tags)
 {
     size_t const num_members = member_roles.size();
-    lua_getglobal(lua_state(), REL_MEM_FUNC);
+    lua_rawgeti(lua_state(), LUA_REGISTRYINDEX, m_func_rel_mem);
 
     lua_newtable(lua_state()); /* relations key value table */
 
