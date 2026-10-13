@@ -240,6 +240,20 @@ The most important changes:
   object processing no longer allocates database connections when there
   is nothing to do.
 
+### Rust speed-spike
+
+To measure how much headroom is left beyond these optimizations, the hot
+import path (PBF decode, mercator projection, EWKB/hex serialization,
+COPY) was also reimplemented as a small, standalone
+[Rust prototype](https://github.com/portlandhodl/osm2pgsql-spike) that
+formats rows in parallel — something the stage-1 architecture here
+cannot do. The prototype produces byte-identical database contents
+(validated on full table dumps) and imported the 48MB Luxembourg
+benchmark extract about 2.3x faster than this optimized C++ build
+(1.9s vs 4.4s), with PostgreSQL's own COPY ingest speed as the remaining
+bottleneck. It is an experiment, not a replacement: it handles a fixed
+schema with nodes and ways only.
+
 ## Help/Support
 
 If you have problems with osm2pgsql or want to report a bug, go to
