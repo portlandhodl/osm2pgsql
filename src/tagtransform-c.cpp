@@ -7,9 +7,12 @@
  * For a full list of authors see the git log.
  */
 
-#include <array>
+#include <charconv>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
+#include <string_view>
+#include <unordered_map>
 
 #include "options.hpp"
 #include "taginfo-impl.hpp"
@@ -18,39 +21,57 @@
 
 namespace {
 
-struct layers_type
+struct layer_info_t
 {
-    char const *highway;
     int offset;
     bool roads;
 };
 
-constexpr std::array<layers_type, 25> LAYERS = {
-    {{"proposed", 1, false},       {"construction", 2, false},
-     {"steps", 10, false},         {"cycleway", 10, false},
-     {"bridleway", 10, false},     {"footway", 10, false},
-     {"path", 10, false},          {"track", 11, false},
-     {"service", 15, false},
+std::unordered_map<std::string_view, layer_info_t> const LAYERS = {
+    {"proposed", {1, false}},       {"construction", {2, false}},
+    {"steps", {10, false}},         {"cycleway", {10, false}},
+    {"bridleway", {10, false}},     {"footway", {10, false}},
+    {"path", {10, false}},          {"track", {11, false}},
+    {"service", {15, false}},
 
-     {"tertiary_link", 24, false}, {"secondary_link", 25, true},
-     {"primary_link", 27, true},   {"trunk_link", 28, true},
-     {"motorway_link", 29, true},
+    {"tertiary_link", {24, false}}, {"secondary_link", {25, true}},
+    {"primary_link", {27, true}},   {"trunk_link", {28, true}},
+    {"motorway_link", {29, true}},
 
-     {"raceway", 30, false},       {"pedestrian", 31, false},
-     {"living_street", 32, false}, {"road", 33, false},
-     {"unclassified", 33, false},  {"residential", 33, false},
-     {"tertiary", 34, false},      {"secondary", 36, true},
-     {"primary", 37, true},        {"trunk", 38, true},
-     {"motorway", 39, true}}};
+    {"raceway", {30, false}},       {"pedestrian", {31, false}},
+    {"living_street", {32, false}}, {"road", {33, false}},
+    {"unclassified", {33, false}},  {"residential", {33, false}},
+    {"tertiary", {34, false}},      {"secondary", {36, true}},
+    {"primary", {37, true}},        {"trunk", {38, true}},
+    {"motorway", {39, true}}};
 
 void add_z_order(taglist_t *tags, bool *roads)
 {
-    std::string const *const layer = tags->get("layer");
-    std::string const *const highway = tags->get("highway");
-    bool const bridge = tags->get_bool("bridge", false);
-    bool const tunnel = tags->get_bool("tunnel", false);
-    std::string const *const railway = tags->get("railway");
-    std::string const *const boundary = tags->get("boundary");
+    std::string const *layer = nullptr;
+    std::string const *highway = nullptr;
+    std::string const *bridge = nullptr;
+    std::string const *tunnel = nullptr;
+    std::string const *railway = nullptr;
+    std::string const *boundary = nullptr;
+
+    /* Single pass over the tags, collecting pointers to the values of
+       the interesting keys. Like taglist_t::get() the first tag found
+       with a given key wins. */
+    for (auto const &tag : *tags) {
+        if (layer == nullptr && tag.key == "layer") {
+            layer = &tag.value;
+        } else if (highway == nullptr && tag.key == "highway") {
+            highway = &tag.value;
+        } else if (bridge == nullptr && tag.key == "bridge") {
+            bridge = &tag.value;
+        } else if (tunnel == nullptr && tag.key == "tunnel") {
+            tunnel = &tag.value;
+        } else if (railway == nullptr && tag.key == "railway") {
+            railway = &tag.value;
+        } else if (boundary == nullptr && tag.key == "boundary") {
+            boundary = &tag.value;
+        }
+    }
 
     int z_order = 0;
 
@@ -59,12 +80,10 @@ void add_z_order(taglist_t *tags, bool *roads)
     *roads = false;
 
     if (highway) {
-        for (auto const &layer : LAYERS) {
-            if (*highway == layer.highway) {
-                z_order += layer.offset;
-                *roads = layer.roads;
-                break;
-            }
+        auto const it = LAYERS.find(*highway);
+        if (it != LAYERS.end()) {
+            z_order += it->second.offset;
+            *roads = it->second.roads;
         }
     }
 
@@ -77,15 +96,19 @@ void add_z_order(taglist_t *tags, bool *roads)
         *roads = true;
     }
 
-    if (bridge) {
+    if (bridge && taglist_t::value_to_bool(bridge->c_str(), false)) {
         z_order += 100;
     }
 
-    if (tunnel) {
+    if (tunnel && taglist_t::value_to_bool(tunnel->c_str(), false)) {
         z_order -= 100;
     }
 
-    tags->add_tag("z_order", fmt::to_string(z_order));
+    /* The z_order value fits into a few characters, so no memory
+       allocation is needed for the string representation. */
+    char zbuf[16];
+    *std::to_chars(zbuf, zbuf + sizeof(zbuf), z_order).ptr = '\0';
+    tags->add_tag("z_order", static_cast<char const *>(zbuf));
 }
 
 bool starts_with(char const *input, std::string const &test) noexcept
@@ -98,29 +121,82 @@ bool starts_with(char const *input, std::string const &test) noexcept
 c_tagtransform_t::c_tagtransform_t(options_t const *options,
                                    export_list_t exlist)
 : m_options(options), m_export_list(std::move(exlist))
-{}
+{
+    /* Build the lookup structures used by check_key() once, so that the
+       per tag check doesn't have to scan the whole export list. */
+    for (auto const type : {osmium::item_type::node, osmium::item_type::way,
+                            osmium::item_type::relation}) {
+        auto const &infos = m_export_list.get(type);
+        auto &lookup = m_key_lookup(type);
+
+        std::size_t pos = 0;
+        for (auto const &info : infos) {
+            if (info.flags & FLAG_DELETE) {
+                /* Delete entries are matched with wild_match(), even if
+                   the name doesn't contain any wildcards. */
+                lookup.wild.push_back({info.name, pos});
+            } else {
+                /* Non-delete entries never contain wildcards (checked when
+                   the style file is read), so they always match exactly.
+                   emplace() keeps the first entry if a key appears more
+                   than once, like the sequential scan over the export
+                   list did. */
+                lookup.exact.emplace(
+                    info.name, key_lookup_t::exact_entry_t{pos, info.flags});
+            }
+            ++pos;
+        }
+    }
+}
 
 std::unique_ptr<tagtransform_t> c_tagtransform_t::clone() const
 {
     return std::make_unique<c_tagtransform_t>(m_options, m_export_list);
 }
 
-bool c_tagtransform_t::check_key(std::vector<taginfo> const &infos,
-                                 char const *k, bool *filter,
-                                 unsigned int *flags)
+bool c_tagtransform_t::check_key(osmium::item_type export_type, char const *k,
+                                 bool *filter, unsigned int *flags)
 {
-    //go through the actual tags found on the item and keep the ones in the export list
-    for (auto const &info : infos) {
-        if (info.flags & FLAG_DELETE) {
-            if (wild_match(info.name.c_str(), k)) {
-                return false;
-            }
-        } else if (std::strcmp(info.name.c_str(), k) == 0) {
-            *filter = false;
-            *flags |= info.flags;
+    constexpr auto npos = std::numeric_limits<std::size_t>::max();
 
-            return true;
+    auto const &lookup = m_key_lookup(export_type);
+
+    /* Position of the first non-delete entry matching this key exactly. */
+    std::size_t p_exact = npos;
+    unsigned int exact_flags = 0;
+
+    auto const exact_it = lookup.exact.find(k);
+    if (exact_it != lookup.exact.end()) {
+        p_exact = exact_it->second.pos;
+        exact_flags = exact_it->second.flags;
+    }
+
+    /* Position of the first delete entry matching this key. The wildcard
+       entries are stored in file order, so the first match has the smallest
+       position. Entries at or after p_exact could never win anyway. */
+    std::size_t p_wild = npos;
+
+    for (auto const &entry : lookup.wild) {
+        if (entry.pos >= p_exact) {
+            break;
         }
+        if (wild_match(entry.pattern.c_str(), k)) {
+            p_wild = entry.pos;
+            break;
+        }
+    }
+
+    /* The entry with the smallest position in the export list wins,
+       exactly like the sequential scan over the export list did. */
+    if (p_exact < p_wild) {
+        *filter = false;
+        *flags |= exact_flags;
+
+        return true;
+    }
+
+    if (p_wild != npos) {
+        return false;
     }
 
     // if we didn't find any tags that we wanted to export
@@ -137,6 +213,9 @@ bool c_tagtransform_t::check_key(std::vector<taginfo> const &infos,
     if (!m_options->hstore_columns.empty()) {
         /* does this column match any of the hstore column prefixes? */
         for (auto const &column : m_options->hstore_columns) {
+            if (!column.empty() && k[0] != column[0]) {
+                continue;
+            }
             if (starts_with(k, column)) {
                 /* ... but if hstore_match_only is set then don't take this
                          as a reason for keeping the object */
@@ -160,11 +239,9 @@ bool c_tagtransform_t::filter_tags(osmium::OSMObject const &o, bool *polygon,
     unsigned int flags = 0;
     int add_area_tag = 0;
 
-    auto export_type = o.type();
-    if (o.type() == osmium::item_type::relation) {
-        export_type = osmium::item_type::way;
-    }
-    auto const &infos = m_export_list.get(export_type);
+    auto const export_type = (o.type() == osmium::item_type::relation)
+                                 ? osmium::item_type::way
+                                 : o.type();
 
     /* We used to only go far enough to determine if it's a polygon or not,
        but now we go through and filter stuff we don't need
@@ -190,7 +267,7 @@ bool c_tagtransform_t::filter_tags(osmium::OSMObject const &o, bool *polygon,
         }
 
         //go through the actual tags found on the item and keep the ones in the export list
-        if (check_key(infos, k, &filter, &flags)) {
+        if (check_key(export_type, k, &filter, &flags)) {
             out_tags->add_tag(k, v);
         }
     }

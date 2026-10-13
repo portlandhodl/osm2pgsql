@@ -13,6 +13,13 @@
 #include "taginfo-impl.hpp"
 #include "tagtransform.hpp"
 
+#include <cstddef>
+#include <functional>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <vector>
+
 class c_tagtransform_t : public tagtransform_t
 {
 public:
@@ -30,11 +37,60 @@ public:
                                 bool *roads, taglist_t *out_tags) override;
 
 private:
-    bool check_key(std::vector<taginfo> const &infos, char const *k,
-                   bool *filter, unsigned int *flags);
+    /**
+     * Transparent string hash so that an unordered_map with std::string
+     * keys can be searched with a char const * key without creating a
+     * temporary std::string.
+     */
+    struct string_hash_t
+    {
+        using is_transparent = void;
+
+        std::size_t operator()(std::string_view sv) const noexcept
+        {
+            return std::hash<std::string_view>{}(sv);
+        }
+    };
+
+    /**
+     * Preprocessed form of the export list of one object type, built
+     * once in the constructor so that check_key() does not have to scan
+     * the whole export list for each tag.
+     */
+    struct key_lookup_t
+    {
+        struct exact_entry_t
+        {
+            std::size_t pos;
+            unsigned int flags;
+        };
+
+        struct wildcard_entry_t
+        {
+            std::string pattern;
+            std::size_t pos;
+        };
+
+        // Entries without FLAG_DELETE never contain wildcards (this is
+        // checked when the style file is read), so they match exactly.
+        // Because emplace() keeps the first value for a key, this maps
+        // the key to the entry with the smallest position, like the
+        // sequential scan over the export list does.
+        std::unordered_map<std::string, exact_entry_t, string_hash_t,
+                           std::equal_to<>>
+            exact;
+
+        // All entries with FLAG_DELETE in file order. These are matched
+        // with wild_match(), even if they don't contain wildcards.
+        std::vector<wildcard_entry_t> wild;
+    };
+
+    bool check_key(osmium::item_type export_type, char const *k, bool *filter,
+                   unsigned int *flags);
 
     options_t const *m_options;
     export_list_t m_export_list;
+    osmium::nwr_array<key_lookup_t> m_key_lookup;
 };
 
 #endif // OSM2PGSQL_TAGTRANSFORM_C_HPP
