@@ -256,8 +256,9 @@ options_t parse_command_line(int argc, char *argv[])
 {
     options_t options;
 
-    options.num_procs = std::min(4U, std::thread::hardware_concurrency());
-    if (options.num_procs < 1) {
+    unsigned int const hw_concurrency = std::thread::hardware_concurrency();
+    options.num_procs = std::min(32U, std::max(1U, hw_concurrency));
+    if (hw_concurrency == 0) {
         log_warn("Unable to detect number of hardware threads supported!"
                  " Using single thread.");
         options.num_procs = 1;
@@ -567,7 +568,8 @@ options_t parse_command_line(int argc, char *argv[])
         // anything that will make sense here.
         ->transform(CLI::Bound(1, 32))
         ->description("Specifies the number of parallel processes used for "
-                      "certain operations (default: number of CPUs).")
+                      "certain operations (default: number of CPUs, up to "
+                      "32).")
         ->type_name("NUM")
         ->group("Advanced options");
 
