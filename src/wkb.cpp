@@ -19,6 +19,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 
 namespace ewkb {
 
@@ -82,6 +83,23 @@ void write_length(std::string *data, std::size_t length)
     str_push(data, static_cast<uint32_t>(length));
 }
 
+// Exact sizes in bytes of the WKB building blocks. These must match what
+// the write_*() functions produce.
+constexpr std::size_t SIZE_BYTE_ORDER = 1UL;
+constexpr std::size_t SIZE_TYPE = 4UL;
+constexpr std::size_t SIZE_SRID = 4UL;
+constexpr std::size_t SIZE_LENGTH = 4UL;
+constexpr std::size_t SIZE_COORDINATE_PAIR = 2UL * sizeof(double);
+
+/**
+ * Size in bytes of a WKB header. The SRID field is only written (and
+ * counted) if the srid is not 0.
+ */
+[[nodiscard]] constexpr std::size_t header_size(uint32_t srid) noexcept
+{
+    return SIZE_BYTE_ORDER + SIZE_TYPE + (srid != 0 ? SIZE_SRID : 0UL);
+}
+
 void write_point(std::string *data, geom::point_t const &geom,
                  uint32_t srid = 0)
 {
@@ -95,9 +113,25 @@ void write_point(std::string *data, geom::point_t const &geom,
 void write_points(std::string *data, geom::point_list_t const &points)
 {
     write_length(data, points.size());
-    for (auto const &point : points) {
-        str_push(data, point.x());
-        str_push(data, point.y());
+    if constexpr (Endian == 1) {
+        // On little-endian hosts the WKB data of a point is identical to
+        // the in-memory representation of geom::point_t (two doubles in
+        // native byte order, x() first), so all points can be copied into
+        // the output in one go instead of appending each coordinate
+        // separately.
+        static_assert(sizeof(geom::point_t) == SIZE_COORDINATE_PAIR,
+                      "geom::point_t must be exactly two doubles");
+        static_assert(std::is_trivially_copyable<geom::point_t>::value,
+                      "geom::point_t must be trivially copyable");
+        if (!points.empty()) {
+            data->append(reinterpret_cast<char const *>(points.data()),
+                         points.size() * sizeof(geom::point_t));
+        }
+    } else {
+        for (auto const &point : points) {
+            str_push(data, point.x());
+            str_push(data, point.y());
+        }
     }
 }
 
@@ -194,6 +228,89 @@ void write_collection(std::string *data, geom::collection_t const &geom,
     }
 }
 
+/**
+ * Calculate the exact size in bytes of the EWKB representation of a
+ * geometry. These functions mirror the write_*() functions above and must
+ * match them byte for byte. They are used to reserve() the output string
+ * to its final size in one go instead of letting it grow (and reallocate)
+ * incrementally while serializing.
+ */
+[[nodiscard]] std::size_t ewkb_size(geom::nullgeom_t const & /*geom*/,
+                                    uint32_t /*srid*/)
+{
+    return 0;
+}
+
+[[nodiscard]] std::size_t ewkb_size(geom::point_t const & /*geom*/,
+                                    uint32_t srid)
+{
+    return header_size(srid) + SIZE_COORDINATE_PAIR;
+}
+
+[[nodiscard]] std::size_t ewkb_size(geom::linestring_t const &geom,
+                                    uint32_t srid)
+{
+    return header_size(srid) + SIZE_LENGTH + geom.size() * SIZE_COORDINATE_PAIR;
+}
+
+[[nodiscard]] std::size_t ewkb_size(geom::polygon_t const &geom, uint32_t srid)
+{
+    return header_size(srid) + SIZE_LENGTH +
+           (1UL + geom.inners().size()) * SIZE_LENGTH +
+           geom.n_points() * SIZE_COORDINATE_PAIR;
+}
+
+[[nodiscard]] std::size_t ewkb_size(geom::multipoint_t const &geom,
+                                    uint32_t srid)
+{
+    return header_size(srid) + SIZE_LENGTH +
+           geom.num_geometries() * (header_size(0) + SIZE_COORDINATE_PAIR);
+}
+
+[[nodiscard]] std::size_t ewkb_size(geom::multilinestring_t const &geom,
+                                    uint32_t srid)
+{
+    return header_size(srid) + SIZE_LENGTH +
+           geom.num_geometries() * (header_size(0) + SIZE_LENGTH) +
+           geom.n_points() * SIZE_COORDINATE_PAIR;
+}
+
+[[nodiscard]] std::size_t ewkb_size(geom::multipolygon_t const &geom,
+                                    uint32_t srid)
+{
+    std::size_t size = header_size(srid) + SIZE_LENGTH +
+                       geom.n_points() * SIZE_COORDINATE_PAIR;
+    for (auto const &polygon : geom) {
+        size += header_size(0) + SIZE_LENGTH +
+                (1UL + polygon.inners().size()) * SIZE_LENGTH;
+    }
+    return size;
+}
+
+[[nodiscard]] std::size_t ewkb_size(geom::collection_t const &geom,
+                                    uint32_t srid);
+
+/**
+ * Size of the EWKB representation of a geometry of any type, used for the
+ * members of a geometry collection.
+ */
+[[nodiscard]] std::size_t ewkb_size_geometry(geom::geometry_t const &geom,
+                                             uint32_t srid)
+{
+    return geom.visit(
+        [&](auto const &input) { return ewkb_size(input, srid); });
+}
+
+[[nodiscard]] std::size_t ewkb_size(geom::collection_t const &geom,
+                                    uint32_t srid)
+{
+    std::size_t size = header_size(srid) + SIZE_LENGTH;
+    for (auto const &item : geom) {
+        size += ewkb_size_geometry(item, 0);
+    }
+    return size;
+}
+
 class make_ewkb_visitor_t
 {
 public:
@@ -215,9 +332,13 @@ public:
         std::string data;
 
         if (m_ensure_multi) {
+            std::size_t const size =
+                header_size(m_srid) + SIZE_LENGTH + ewkb_size(geom, 0);
+            data.reserve(size);
             write_header(&data, wkb_multi_point, m_srid);
             write_length(&data, 1);
             write_point(&data, geom);
+            assert(data.size() == size);
         } else {
             data.reserve(SIZE_POINT);
             write_point(&data, geom, m_srid);
@@ -260,11 +381,18 @@ public:
         std::string data;
 
         if (m_ensure_multi) {
+            std::size_t const size =
+                header_size(m_srid) + SIZE_LENGTH + ewkb_size(geom, 0);
+            data.reserve(size);
             write_header(&data, wkb_multi_polygon, m_srid);
             write_length(&data, 1);
             write_polygon(&data, geom);
+            assert(data.size() == size);
         } else {
+            std::size_t const size = ewkb_size(geom, m_srid);
+            data.reserve(size);
             write_polygon(&data, geom, m_srid);
+            assert(data.size() == size);
         }
 
         return data;
@@ -272,35 +400,45 @@ public:
 
     std::string operator()(geom::multipoint_t const &geom) const
     {
+        std::size_t const size = ewkb_size(geom, m_srid);
         std::string data;
+        data.reserve(size);
         write_multipoint(&data, geom, m_srid);
+        assert(data.size() == size);
         return data;
     }
 
     std::string operator()(geom::multilinestring_t const &geom) const
     {
+        std::size_t const size = ewkb_size(geom, m_srid);
         std::string data;
+        data.reserve(size);
         write_multilinestring(&data, geom, m_srid);
+        assert(data.size() == size);
         return data;
     }
 
     std::string operator()(geom::multipolygon_t const &geom) const
     {
+        std::size_t const size = ewkb_size(geom, m_srid);
         std::string data;
+        data.reserve(size);
         write_multipolygon(&data, geom, m_srid);
+        assert(data.size() == size);
         return data;
     }
 
     std::string operator()(geom::collection_t const &geom) const
     {
+        std::size_t const size = ewkb_size(geom, m_srid);
         std::string data;
+        data.reserve(size);
         write_collection(&data, geom, m_srid);
+        assert(data.size() == size);
         return data;
     }
 
 private:
-    static constexpr std::size_t SIZE_COORDINATE_PAIR = 2UL * sizeof(double);
-
     uint32_t m_srid;
     bool m_ensure_multi;
 
