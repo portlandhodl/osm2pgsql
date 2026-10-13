@@ -90,9 +90,30 @@ public:
 
 private:
     /**
+     * A polygon with all its rings converted to tile coordinates.
+     */
+    struct tile_polygon_t
+    {
+        std::vector<geom::point_t> outer;
+        std::vector<std::vector<geom::point_t>> inners;
+    };
+
+    /**
      * Converts from target coordinates to tile coordinates.
      */
     geom::point_t coords_to_tile(geom::point_t const &point);
+
+    /**
+     * Converts a list of points from target coordinates to tile coordinates.
+     */
+    std::vector<geom::point_t>
+    coords_to_tile_list(geom::point_list_t const &list);
+
+    /**
+     * Converts all rings of a polygon from target coordinates to tile
+     * coordinates.
+     */
+    tile_polygon_t polygon_to_tile_coords(geom::polygon_t const &geom);
 
     /**
      * Expire a single tile.
@@ -105,13 +126,23 @@ private:
     uint32_t normalise_tile_x_coord(int x) const;
 
     void build_tile_list(std::vector<uint32_t> *tile_x_list,
-                         geom::ring_t const &ring, double tile_y);
+                         std::vector<geom::point_t> const &ring, double tile_y);
 
-    void from_line_segment(geom::point_t const &a, geom::point_t const &b,
-                           expire_config_t const &expire_config);
+    void from_line_segment_tiles(geom::point_t tilec_a, geom::point_t tilec_b,
+                                 expire_config_t const &expire_config);
 
     void from_point_list(geom::point_list_t const &list,
                          expire_config_t const &expire_config);
+
+    void from_point_list_tiles(std::vector<geom::point_t> const &list,
+                               expire_config_t const &expire_config);
+
+    void from_polygon_boundary_tiles(tile_polygon_t const &geom,
+                                     expire_config_t const &expire_config);
+
+    void from_polygon_area_tiles(geom::polygon_t const &geom,
+                                 tile_polygon_t const &tile_geom,
+                                 geom::box_t box);
 
     /// This is where we collect all the expired tiles.
     std::unordered_set<quadkey_t> m_dirty_tiles;

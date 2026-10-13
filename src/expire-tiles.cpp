@@ -69,12 +69,52 @@ geom::point_t expire_tiles_t::coords_to_tile(geom::point_t const &point)
             m_map_width * (0.5 - c.y() / tile_t::EARTH_CIRCUMFERENCE)};
 }
 
+std::vector<geom::point_t>
+expire_tiles_t::coords_to_tile_list(geom::point_list_t const &list)
+{
+    std::vector<geom::point_t> result;
+    result.reserve(list.size());
+    for (auto const &point : list) {
+        result.push_back(coords_to_tile(point));
+    }
+    return result;
+}
+
+expire_tiles_t::tile_polygon_t
+expire_tiles_t::polygon_to_tile_coords(geom::polygon_t const &geom)
+{
+    tile_polygon_t result;
+    result.outer = coords_to_tile_list(geom.outer());
+    result.inners.reserve(geom.inners().size());
+    for (auto const &ring : geom.inners()) {
+        result.inners.push_back(coords_to_tile_list(ring));
+    }
+    return result;
+}
+
 void expire_tiles_t::from_point_list(geom::point_list_t const &list,
                                      expire_config_t const &expire_config)
 {
-    for_each_segment(list, [&](geom::point_t const &a, geom::point_t const &b) {
-        from_line_segment(a, b, expire_config);
-    });
+    assert(!list.empty());
+    geom::point_t prev = coords_to_tile(list.front());
+    for (std::size_t i = 1; i < list.size(); ++i) {
+        geom::point_t const cur = coords_to_tile(list[i]);
+        from_line_segment_tiles(prev, cur, expire_config);
+        prev = cur;
+    }
+}
+
+void expire_tiles_t::from_point_list_tiles(
+    std::vector<geom::point_t> const &list,
+    expire_config_t const &expire_config)
+{
+    assert(!list.empty());
+    geom::point_t prev = list.front();
+    for (std::size_t i = 1; i < list.size(); ++i) {
+        geom::point_t const cur = list[i];
+        from_line_segment_tiles(prev, cur, expire_config);
+        prev = cur;
+    }
 }
 
 void expire_tiles_t::from_geometry(geom::point_t const &geom,
@@ -104,13 +144,19 @@ void expire_tiles_t::from_geometry(geom::linestring_t const &geom,
     from_point_list(geom, expire_config);
 }
 
+void expire_tiles_t::from_polygon_boundary_tiles(
+    tile_polygon_t const &geom, expire_config_t const &expire_config)
+{
+    from_point_list_tiles(geom.outer, expire_config);
+    for (auto const &inner : geom.inners) {
+        from_point_list_tiles(inner, expire_config);
+    }
+}
+
 void expire_tiles_t::from_polygon_boundary(geom::polygon_t const &geom,
                                            expire_config_t const &expire_config)
 {
-    from_point_list(geom.outer(), expire_config);
-    for (auto const &inner : geom.inners()) {
-        from_point_list(inner, expire_config);
-    }
+    from_polygon_boundary_tiles(polygon_to_tile_coords(geom), expire_config);
 }
 
 namespace {
@@ -136,12 +182,13 @@ expire_mode decide_expire_mode(TGEOM const &geom,
 } // anonymous namespace
 
 void expire_tiles_t::build_tile_list(std::vector<uint32_t> *tile_x_list,
-                                     geom::ring_t const &ring, double tile_y)
+                                     std::vector<geom::point_t> const &ring,
+                                     double tile_y)
 {
     assert(!ring.empty());
     for (std::size_t i = 1; i < ring.size(); ++i) {
-        auto const t1 = coords_to_tile(ring[i]);
-        auto const t2 = coords_to_tile(ring[i - 1]);
+        auto const t1 = ring[i];
+        auto const t2 = ring[i - 1];
 
         if ((t1.y() < tile_y && t2.y() >= tile_y) ||
             (t2.y() < tile_y && t1.y() >= tile_y)) {
@@ -155,6 +202,13 @@ void expire_tiles_t::build_tile_list(std::vector<uint32_t> *tile_x_list,
 
 void expire_tiles_t::from_polygon_area(geom::polygon_t const &geom,
                                        geom::box_t box)
+{
+    from_polygon_area_tiles(geom, polygon_to_tile_coords(geom), box);
+}
+
+void expire_tiles_t::from_polygon_area_tiles(geom::polygon_t const &geom,
+                                             tile_polygon_t const &tile_geom,
+                                             geom::box_t box)
 {
     if (!box.valid()) {
         box = geom::envelope(geom);
@@ -181,9 +235,9 @@ void expire_tiles_t::from_polygon_area(geom::polygon_t const &geom,
 
         // Build a list of tiles crossed by the area boundary
         tile_x_list.clear();
-        build_tile_list(&tile_x_list, geom.outer(),
+        build_tile_list(&tile_x_list, tile_geom.outer,
                         static_cast<double>(tile_y));
-        for (auto const &ring : geom.inners()) {
+        for (auto const &ring : tile_geom.inners) {
             build_tile_list(&tile_x_list, ring, static_cast<double>(tile_y));
         }
 
@@ -212,13 +266,15 @@ void expire_tiles_t::from_geometry(geom::polygon_t const &geom,
     geom::box_t box;
     auto const mode = decide_expire_mode(geom, expire_config, &box);
 
-    from_polygon_boundary(geom, expire_config);
+    auto const tile_geom = polygon_to_tile_coords(geom);
+
+    from_polygon_boundary_tiles(tile_geom, expire_config);
 
     // Only need to expire area if in full_area mode. If there is only a
     // single tile expired the whole polygon is inside that tile and we
     // don't need to do the polygon expire.
     if (mode == expire_mode::full_area && m_dirty_tiles.size() > 1) {
-        from_polygon_area(geom, box);
+        from_polygon_area_tiles(geom, tile_geom, box);
     }
 }
 
@@ -228,16 +284,22 @@ void expire_tiles_t::from_geometry(geom::multipolygon_t const &geom,
     geom::box_t box;
     auto const mode = decide_expire_mode(geom, expire_config, &box);
 
+    std::vector<tile_polygon_t> tile_geoms;
+    tile_geoms.reserve(geom.num_geometries());
     for (auto const &sgeom : geom) {
-        from_polygon_boundary(sgeom, expire_config);
+        tile_geoms.push_back(polygon_to_tile_coords(sgeom));
+    }
+
+    for (std::size_t i = 0; i < geom.num_geometries(); ++i) {
+        from_polygon_boundary_tiles(tile_geoms[i], expire_config);
     }
 
     // Only need to expire area if in full_area mode. If there is only a
     // single tile expired the whole polygon is inside that tile and we
     // don't need to do the polygon expire.
     if (mode == expire_mode::full_area && m_dirty_tiles.size() > 1) {
-        for (auto const &sgeom : geom) {
-            from_polygon_area(sgeom, geom::box_t{});
+        for (std::size_t i = 0; i < geom.num_geometries(); ++i) {
+            from_polygon_area_tiles(geom[i], tile_geoms[i], geom::box_t{});
         }
     }
 }
@@ -265,13 +327,10 @@ void expire_tiles_t::from_geometry_if_3857(geom::geometry_t const &geom,
 /*
  * Expire tiles that a line crosses
  */
-void expire_tiles_t::from_line_segment(geom::point_t const &a,
-                                       geom::point_t const &b,
-                                       expire_config_t const &expire_config)
+void expire_tiles_t::from_line_segment_tiles(
+    geom::point_t tilec_a, geom::point_t tilec_b,
+    expire_config_t const &expire_config)
 {
-    auto tilec_a = coords_to_tile(a);
-    auto tilec_b = coords_to_tile(b);
-
     if (tilec_a.x() > tilec_b.x()) {
         /* We always want the line to go from left to right - swap the ends if it doesn't */
         std::swap(tilec_a, tilec_b);
