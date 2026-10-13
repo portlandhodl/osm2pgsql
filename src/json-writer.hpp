@@ -39,7 +39,7 @@ public:
     template <typename T, std::enable_if_t<std::is_integral_v<T>, bool> = true>
     void number(T value)
     {
-        m_buffer += fmt::to_string(value);
+        fmt::format_to(std::back_inserter(m_buffer), FMT_STRING("{}"), value);
     }
 
     void string(char const *str)
