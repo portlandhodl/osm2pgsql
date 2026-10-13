@@ -13,8 +13,10 @@
 #include "logging.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <string>
+#include <string_view>
 #include <variant>
 
 /// A "NULL" value for a parameter. Same as not set.
@@ -80,19 +82,19 @@ public:
         m_map.erase(std::forward<K>(key));
     }
 
-    bool has(std::string const &key) const noexcept;
+    bool has(std::string_view key) const noexcept;
 
-    param_value_t get(std::string const &key) const;
+    param_value_t get(std::string_view key) const;
 
-    bool get_bool(std::string const &key, bool default_value = false) const;
+    bool get_bool(std::string_view key, bool default_value = false) const;
 
-    int64_t get_int64(std::string const &key, int64_t default_value = 0) const;
+    int64_t get_int64(std::string_view key, int64_t default_value = 0) const;
 
-    double get_double(std::string const &key, double default_value = 0.0) const;
+    double get_double(std::string_view key, double default_value = 0.0) const;
 
-    std::string get_string(std::string const &key) const;
+    std::string get_string(std::string_view key) const;
 
-    std::string get_string(std::string const &key,
+    std::string get_string(std::string_view key,
                            std::string const &default_value) const;
 
     std::string get_identifier(std::string const &key) const;
@@ -106,7 +108,7 @@ public:
 
 private:
     template <typename T>
-    T get_by_type(std::string const &key, T default_value) const
+    T get_by_type(std::string_view key, T default_value) const
     {
         auto const it = m_map.find(key);
         if (it == m_map.end()) {
@@ -120,12 +122,12 @@ private:
         return std::get<T>(it->second);
     }
 
-    std::map<std::string, param_value_t> m_map;
+    std::map<std::string, param_value_t, std::less<>> m_map;
 }; // class params_t
 
 void write_to_debug_log(params_t const &params, char const *message);
 
-unsigned int uint_in_range(params_t const &params, std::string const &key,
+unsigned int uint_in_range(params_t const &params, std::string_view key,
                            unsigned int min, unsigned int max,
                            unsigned int default_value);
 

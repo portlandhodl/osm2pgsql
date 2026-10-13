@@ -14,6 +14,8 @@
 #include "overloaded.hpp"
 #include "pgsql.hpp"
 
+#include <stdexcept>
+
 std::string to_string(param_value_t const &value)
 {
     return std::visit(
@@ -23,27 +25,31 @@ std::string to_string(param_value_t const &value)
         value);
 }
 
-param_value_t params_t::get(std::string const &key) const
+param_value_t params_t::get(std::string_view key) const
 {
-    return m_map.at(key);
+    auto const it = m_map.find(key);
+    if (it == m_map.end()) {
+        throw std::out_of_range{"Missing parameter."};
+    }
+    return it->second;
 }
 
-bool params_t::has(std::string const &key) const noexcept
+bool params_t::has(std::string_view key) const noexcept
 {
     return m_map.count(key) > 0;
 }
 
-bool params_t::get_bool(std::string const &key, bool default_value) const
+bool params_t::get_bool(std::string_view key, bool default_value) const
 {
     return get_by_type<bool>(key, default_value);
 }
 
-int64_t params_t::get_int64(std::string const &key, int64_t default_value) const
+int64_t params_t::get_int64(std::string_view key, int64_t default_value) const
 {
     return get_by_type<int64_t>(key, default_value);
 }
 
-double params_t::get_double(std::string const &key, double default_value) const
+double params_t::get_double(std::string_view key, double default_value) const
 {
     auto const it = m_map.find(key);
     if (it == m_map.end()) {
@@ -61,7 +67,7 @@ double params_t::get_double(std::string const &key, double default_value) const
     throw fmt_error("Invalid value '{}' for {}.", to_string(it->second), key);
 }
 
-std::string params_t::get_string(std::string const &key) const
+std::string params_t::get_string(std::string_view key) const
 {
     auto const it = m_map.find(key);
     if (it == m_map.end()) {
@@ -70,7 +76,7 @@ std::string params_t::get_string(std::string const &key) const
     return to_string(it->second);
 }
 
-std::string params_t::get_string(std::string const &key,
+std::string params_t::get_string(std::string_view key,
                                  std::string const &default_value) const
 {
     return get_by_type<std::string>(key, default_value);
@@ -98,7 +104,7 @@ void params_t::check_identifier_with_default(std::string const &key,
     }
 }
 
-unsigned int uint_in_range(params_t const &params, std::string const &key,
+unsigned int uint_in_range(params_t const &params, std::string_view key,
                            unsigned int min, unsigned int max,
                            unsigned int default_value)
 {
