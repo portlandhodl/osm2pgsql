@@ -84,8 +84,11 @@ void locator_t::build_index()
         m_data.emplace_back(region.box(), n++);
     }
 
-    m_rtree.clear();
-    m_rtree.insert(m_data.cbegin(), m_data.cend());
+    // Build the new index with the bulk-loading (packing) constructor and
+    // replace the old index with it. This is much faster than inserting
+    // the elements one by one.
+    tree_t tmp{m_data.cbegin(), m_data.cend()};
+    m_rtree = std::move(tmp);
 }
 
 void locator_t::all_intersecting_visit(geom::geometry_t const &geom,
