@@ -81,6 +81,10 @@ void progress_display_t::print_status(std::time_t now) const
 
 void progress_display_t::possibly_print_status()
 {
+    if (!m_enabled) {
+        return;
+    }
+
     std::time_t const now = std::time(nullptr);
 
     if (m_last_print_time < now) {
