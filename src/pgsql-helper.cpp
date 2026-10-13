@@ -13,22 +13,6 @@
 #include "pgsql.hpp"
 #include "pgsql-capabilities.hpp"
 
-#include <cassert>
-
-idlist_t get_ids_from_result(pg_result_t const &result)
-{
-    assert(result.num_tuples() >= 0);
-
-    idlist_t ids;
-    ids.reserve(static_cast<std::size_t>(result.num_tuples()));
-
-    for (int i = 0; i < result.num_tuples(); ++i) {
-        ids.push_back(osmium::string_to_object_id(result.get_value(i, 0)));
-    }
-
-    return ids;
-}
-
 void analyze_table(pg_conn_t const &db_connection, std::string const &schema,
                    std::string const &name)
 {
