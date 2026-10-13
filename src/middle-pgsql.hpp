@@ -18,8 +18,8 @@
  * emit the final geometry-enabled output formats
 */
 
-#include <map>
 #include <memory>
+#include <unordered_map>
 
 #include <osmium/index/nwr_array.hpp>
 
@@ -179,7 +179,7 @@ private:
     void build_way_node_index();
     void build_relation_member_indexes();
 
-    std::map<osmium::user_id_type, std::string> m_users;
+    std::unordered_map<osmium::user_id_type, std::string> m_users;
     osmium::nwr_array<table_desc_t> m_tables;
 
     options_t const *m_options;

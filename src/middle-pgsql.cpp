@@ -15,6 +15,7 @@
  * emit the final geometry-enabled output formats
 */
 
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <cstdlib>
@@ -24,6 +25,7 @@
 #include <string>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include <osmium/builder/osm_object_builder.hpp>
 #include <osmium/memory/buffer.hpp>
@@ -50,6 +52,7 @@ void send_id_list(pg_conn_t const &db_connection, std::string const &table,
                   idlist_t const &ids)
 {
     std::string data;
+    data.reserve(ids.size() * 12);
     for (auto const id : ids) {
         fmt::format_to(std::back_inserter(data), FMT_STRING("{}\n"), id);
     }
@@ -65,6 +68,7 @@ void load_id_list(pg_conn_t const &db_connection, std::string const &table,
 {
     auto const res = db_connection.exec(
         fmt::format("SELECT DISTINCT id FROM {} ORDER BY id", table));
+    ids->reserve(static_cast<std::size_t>(res.num_tuples()));
     for (int n = 0; n < res.num_tuples(); ++n) {
         ids->push_back(osmium::string_to_object_id(res.get_value(n, 0)));
     }
@@ -124,6 +128,106 @@ void middle_pgsql_t::table_desc_t::init_max_id(pg_conn_t const &db_connection)
 namespace {
 
 /**
+ * Helper class for parsing tags encoded in JSON.
+ */
+class tag_list_json_builder_t
+{
+public:
+    explicit tag_list_json_builder_t(osmium::builder::TagListBuilder *builder)
+    : m_builder(builder)
+    {
+    }
+
+    // The tags column in the database must be a flat object with only
+    // string values. Anything else indicates a broken database, so we
+    // throw (matching the old DOM-based parser which rejected non-object
+    // top-level values and non-string values).
+
+    [[noreturn]] static void invalid_format()
+    {
+        throw std::runtime_error{"Database format for tags invalid."};
+    }
+
+    static bool number_integer(nlohmann::json::number_integer_t /*val*/)
+    {
+        invalid_format();
+    }
+
+    static bool number_unsigned(nlohmann::json::number_unsigned_t /*val*/)
+    {
+        invalid_format();
+    }
+
+    static bool number_float(nlohmann::json::number_float_t /*val*/,
+                             nlohmann::json::string_t const & /*s*/)
+    {
+        invalid_format();
+    }
+
+    bool key(nlohmann::json::string_t &val)
+    {
+        m_key = val;
+        return true;
+    }
+
+    bool string(nlohmann::json::string_t &val)
+    {
+        if (m_depth != 1) {
+            invalid_format();
+        }
+        m_tags.emplace_back(m_key, val);
+        return true;
+    }
+
+    bool end_object()
+    {
+        assert(m_depth == 1);
+        // Sort the tags by key to reproduce the ordering that the old
+        // DOM-based parser produced (nlohmann::json stores objects in a
+        // std::map) even though the database may return the keys of a
+        // jsonb object in a different order.
+        std::sort(m_tags.begin(), m_tags.end());
+        for (auto const &tag : m_tags) {
+            m_builder->add_tag(tag.first, tag.second);
+        }
+        m_tags.clear();
+        return true;
+    }
+
+    static bool null() { invalid_format(); }
+    static bool boolean(bool /*val*/) { invalid_format(); }
+    static bool binary(std::vector<std::uint8_t> & /*val*/)
+    {
+        invalid_format();
+    }
+
+    bool start_object(std::size_t /*elements*/)
+    {
+        ++m_depth;
+        if (m_depth != 1) {
+            invalid_format();
+        }
+        return true;
+    }
+
+    static bool start_array(std::size_t /*elements*/) { invalid_format(); }
+    static bool end_array() { return true; }
+
+    static bool parse_error(std::size_t /*position*/,
+                            std::string const & /*last_token*/,
+                            nlohmann::json::exception const &ex)
+    {
+        throw ex;
+    }
+
+private:
+    osmium::builder::TagListBuilder *m_builder;
+    std::vector<std::pair<std::string, std::string>> m_tags;
+    std::string m_key;
+    int m_depth = 0;
+}; // class tag_list_json_builder_t
+
+/**
  * Parse JSON-encoded tags from a version 2 middle table and add them to the
  * builder.
  */
@@ -135,16 +239,9 @@ void pgsql_parse_json_tags(char const *string, osmium::memory::Buffer *buffer,
         return;
     }
 
-    auto const tags = nlohmann::json::parse(string);
-    if (!tags.is_object()) {
-        throw std::runtime_error{"Database format for tags invalid."};
-    }
-
-    // These will come out sorted, because internally "tags" uses a std::map.
     osmium::builder::TagListBuilder builder{*buffer, obuilder};
-    for (auto const &tag : tags.items()) {
-        builder.add_tag(tag.key(), tag.value());
-    }
+    tag_list_json_builder_t parser{&builder};
+    nlohmann::json::sax_parse(string, &parser);
 }
 
 /**
@@ -395,40 +492,66 @@ void middle_pgsql_t::copy_tags(osmium::OSMObject const &obj)
 std::size_t middle_query_pgsql_t::get_way_node_locations_db(
     osmium::WayNodeList *nodes) const
 {
-    size_t count = 0;
-    util::string_joiner_t id_list{',', '\0', '{', '}'};
+    std::size_t count = 0;
 
-    // get nodes where possible from cache,
-    // at the same time build a list for querying missing nodes from DB
+    // get nodes where possible from cache, at the same time collect the
+    // misses together with their position in the list for querying the
+    // remaining nodes from the DB
+    std::vector<std::pair<osmid_t, uint32_t>> misses;
+    misses.reserve(nodes->size());
+
+    uint32_t index = 0;
     for (auto &n : *nodes) {
         auto const loc = m_cache->get(n.ref());
         if (loc.valid()) {
             n.set_location(loc);
             ++count;
         } else {
-            id_list.add(fmt::to_string(n.ref()));
+            misses.emplace_back(n.ref(), index);
         }
+        ++index;
     }
 
-    if (id_list.empty()) {
+    if (misses.empty()) {
         return count;
     }
 
+    std::sort(misses.begin(), misses.end());
+
+    // A way can reference the same node several times. Add ids only once
+    // to the id list, the position is looked up for each result row.
+    std::string id_list;
+    id_list.reserve(misses.size() * 12 + 2);
+    id_list += '{';
+    for (std::size_t i = 0; i < misses.size(); ++i) {
+        if (i > 0 && misses[i].first == misses[i - 1].first) {
+            continue;
+        }
+        if (id_list.size() > 1) {
+            id_list += ',';
+        }
+        fmt::format_to(std::back_inserter(id_list), FMT_STRING("{}"),
+                       misses[i].first);
+    }
+    id_list += '}';
+
     // get any remaining nodes from the DB
     // Nodes must have been written back at this point.
-    auto const res = m_db_connection.exec_prepared("get_node_list", id_list());
-    std::unordered_map<osmid_t, osmium::Location> locs;
-    for (int i = 0; i < res.num_tuples(); ++i) {
-        locs.emplace(osmium::string_to_object_id(res.get_value(i, 0)),
-                     osmium::Location{
-                         (int)std::strtol(res.get_value(i, 1), nullptr, 10),
-                         (int)std::strtol(res.get_value(i, 2), nullptr, 10)});
-    }
+    auto const res = m_db_connection.exec_prepared("get_node_list", id_list);
 
-    for (auto &n : *nodes) {
-        auto const el = locs.find(n.ref());
-        if (el != locs.end()) {
-            n.set_location(el->second);
+    for (int row = 0; row < res.num_tuples(); ++row) {
+        auto const ref = osmium::string_to_object_id(res.get_value(row, 0));
+        osmium::Location const location{
+            (int)std::strtol(res.get_value(row, 1), nullptr, 10),
+            (int)std::strtol(res.get_value(row, 2), nullptr, 10)};
+
+        // Set the location on all nodes in the list with this ref.
+        for (auto it = std::lower_bound(
+                 misses.begin(), misses.end(), ref,
+                 [](std::pair<osmid_t, uint32_t> const &entry,
+                    osmid_t id) noexcept { return entry.first < id; });
+             it != misses.end() && it->first == ref; ++it) {
+            (*nodes)[it->second].set_location(location);
             ++count;
         }
     }
@@ -825,7 +948,7 @@ middle_query_pgsql_t::rel_members_get(osmium::Relation const &rel,
     assert((types & osmium::osm_entity_bits::relation) == 0);
 
     pg_result_t res;
-    idlist_t wayidspg;
+    std::vector<std::pair<osmid_t, int>> way_rows;
     if (types & osmium::osm_entity_bits::way) {
         // collect ids from all way members into a list..
         util::string_joiner_t way_ids{',', '\0', '{', '}'};
@@ -838,7 +961,17 @@ middle_query_pgsql_t::rel_members_get(osmium::Relation const &rel,
         // ...and get those ways from database
         if (!way_ids.empty()) {
             res = m_db_connection.exec_prepared("get_way_list", way_ids());
-            wayidspg = get_ids_from_result(res);
+
+            // The ids are unique (id is the primary key of the ways table),
+            // so sorting by id makes the result rows searchable with
+            // lower_bound. There are at most as many rows as ways in the
+            // relation, because missing ways are not returned at all.
+            way_rows.reserve(static_cast<std::size_t>(res.num_tuples()));
+            for (int j = 0; j < res.num_tuples(); ++j) {
+                way_rows.emplace_back(
+                    osmium::string_to_object_id(res.get_value(j, 0)), j);
+            }
+            std::sort(way_rows.begin(), way_rows.end());
         }
     }
 
@@ -850,16 +983,20 @@ middle_query_pgsql_t::rel_members_get(osmium::Relation const &rel,
             builder.set_id(member.ref());
             ++members_found;
         } else if (member.type() == osmium::item_type::way &&
-                   (types & osmium::osm_entity_bits::way) && res) {
-            // Match the list of ways coming from postgres in a different order
-            // back to the list of ways given by the caller
-            for (int j = 0; j < res.num_tuples(); ++j) {
-                if (member.ref() == wayidspg[static_cast<std::size_t>(j)]) {
-                    build_way(member.ref(), res, j, 1, buffer,
-                              m_store_options.with_attributes);
-                    ++members_found;
-                    break;
-                }
+                   (types & osmium::osm_entity_bits::way)) {
+            // Match the list of ways coming from postgres in a different
+            // order back to the list of ways given by the caller. If the
+            // same way appears several times as member, each occurrence is
+            // matched to the (single) result row for that way.
+            auto const it = std::lower_bound(
+                way_rows.begin(), way_rows.end(), member.ref(),
+                [](std::pair<osmid_t, int> const &row, osmid_t id) noexcept {
+                    return row.first < id;
+                });
+            if (it != way_rows.end() && it->first == member.ref()) {
+                build_way(member.ref(), res, it->second, 1, buffer,
+                          m_store_options.with_attributes);
+                ++members_found;
             }
         }
     }
