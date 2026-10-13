@@ -13,6 +13,7 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -255,17 +256,25 @@ public:
     }
 
 private:
-    /// Get the next id from the queue.
-    static osmid_t pop_id(idlist_t *queue, std::mutex *mutex)
+    /// Maximum number of ids taken from the queue in one go.
+    static std::size_t constexpr batch_size = 32;
+
+    /**
+     * Get the next batch of ids from the queue. Takes up to batch_size
+     * ids from the queue under one lock acquisition to reduce contention.
+     * Returns an empty vector when the queue is empty.
+     */
+    static std::vector<osmid_t> pop_ids(idlist_t *queue, std::mutex *mutex)
     {
-        osmid_t id = 0;
+        std::vector<osmid_t> ids;
+        ids.reserve(batch_size);
 
         std::lock_guard<std::mutex> const lock{*mutex};
-        if (!queue->empty()) {
-            id = queue->pop_id();
+        while (!queue->empty() && ids.size() < batch_size) {
+            ids.push_back(queue->pop_id());
         }
 
-        return id;
+        return ids;
     }
 
     // Pointer to a member function of output_t taking an osm_id
@@ -278,8 +287,14 @@ private:
     static void run(std::shared_ptr<output_t> const &output, idlist_t *queue,
                     std::mutex *mutex, output_member_fn_ptr func)
     {
-        while (osmid_t const id = pop_id(queue, mutex)) {
-            (output.get()->*func)(id);
+        for (;;) {
+            auto const ids = pop_ids(queue, mutex);
+            if (ids.empty()) {
+                break;
+            }
+            for (osmid_t const id : ids) {
+                (output.get()->*func)(id);
+            }
         }
         output->sync();
     }
@@ -287,18 +302,23 @@ private:
     /// Runs in a worker thread: Update progress display once per second.
     static void print_stats(idlist_t *queue, std::mutex *mutex)
     {
-        std::size_t queue_size = 0;
-        do {
+        if (!get_logger().show_progress()) {
+            return;
+        }
+
+        for (;;) {
             mutex->lock();
-            queue_size = queue->size();
+            auto const queue_size = queue->size();
             mutex->unlock();
 
-            if (get_logger().show_progress()) {
-                fmt::print(stderr, "\rLeft to process: {}...", queue_size);
+            fmt::print(stderr, "\rLeft to process: {}...", queue_size);
+
+            if (queue_size == 0) {
+                break;
             }
 
             std::this_thread::sleep_for(std::chrono::seconds{1});
-        } while (queue_size > 0);
+        }
     }
 
     void process_queue(char const *type, idlist_t list,
@@ -370,18 +390,29 @@ private:
 
 void osmdata_t::process_dependents()
 {
-    multithreaded_processor_t proc{m_connection_params, m_mid, m_output,
-                                   m_num_procs};
+    // The multithreaded_processor_t constructor is expensive (it creates
+    // per-thread database connections), so only create it lazily when there
+    // is actually something to do.
+    std::optional<multithreaded_processor_t> processor;
+
+    auto const get_processor = [&]() {
+        if (!processor) {
+            processor.emplace(m_connection_params, m_mid, m_output,
+                              m_num_procs);
+        }
+        return &*processor;
+    };
 
     // stage 1b processing: process parents of changed objects
     if (!m_ways_pending_tracker.empty() || !m_rels_pending_tracker.empty()) {
         if (!m_ways_pending_tracker.empty()) {
             m_ways_pending_tracker.sort_unique();
-            proc.process_ways(std::move(m_ways_pending_tracker));
+            get_processor()->process_ways(std::move(m_ways_pending_tracker));
         }
         if (!m_rels_pending_tracker.empty()) {
             m_rels_pending_tracker.sort_unique();
-            proc.process_relations(std::move(m_rels_pending_tracker));
+            get_processor()->process_relations(
+                std::move(m_rels_pending_tracker));
         }
     }
 
@@ -402,7 +433,7 @@ void osmdata_t::process_dependents()
     }
 
     rels_pending_tracker.sort_unique();
-    proc.process_relations_stage1c(std::move(rels_pending_tracker));
+    get_processor()->process_relations_stage1c(std::move(rels_pending_tracker));
 }
 
 void osmdata_t::stop()
