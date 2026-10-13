@@ -278,14 +278,17 @@ void flex_write_column(lua_State *lua_state, geometry_cache_t *geom_cache,
         return;
     }
 
-    if (column.type() == table_column_type::text) {
+    switch (column.type()) {
+    case table_column_type::text: {
         auto const *const str = lua_tolstring(lua_state, -1, nullptr);
         if (!str) {
             throw fmt_error("Invalid type '{}' for text column.",
                             lua_typename(lua_state, ltype));
         }
         copy_mgr->add_column(str);
-    } else if (column.type() == table_column_type::boolean) {
+        break;
+    }
+    case table_column_type::boolean: {
         switch (ltype) {
         case LUA_TBOOLEAN:
             copy_mgr->add_column(lua_toboolean(lua_state, -1) != 0);
@@ -301,7 +304,9 @@ void flex_write_column(lua_State *lua_state, geometry_cache_t *geom_cache,
             throw fmt_error("Invalid type '{}' for boolean column.",
                             lua_typename(lua_state, ltype));
         }
-    } else if (column.type() == table_column_type::int2) {
+        break;
+    }
+    case table_column_type::int2: {
         if (ltype == LUA_TNUMBER) {
             int64_t const value = lua_tointeger(lua_state, -1);
             if (value >= std::numeric_limits<int16_t>::min() &&
@@ -319,7 +324,9 @@ void flex_write_column(lua_State *lua_state, geometry_cache_t *geom_cache,
             throw fmt_error("Invalid type '{}' for int2 column.",
                             lua_typename(lua_state, ltype));
         }
-    } else if (column.type() == table_column_type::int4) {
+        break;
+    }
+    case table_column_type::int4: {
         if (ltype == LUA_TNUMBER) {
             int64_t const value = lua_tointeger(lua_state, -1);
             if (value >= std::numeric_limits<int32_t>::min() &&
@@ -337,7 +344,9 @@ void flex_write_column(lua_State *lua_state, geometry_cache_t *geom_cache,
             throw fmt_error("Invalid type '{}' for int4 column.",
                             lua_typename(lua_state, ltype));
         }
-    } else if (column.type() == table_column_type::int8) {
+        break;
+    }
+    case table_column_type::int8: {
         if (ltype == LUA_TNUMBER) {
             copy_mgr->add_column(lua_tointeger(lua_state, -1));
         } else if (ltype == LUA_TSTRING) {
@@ -349,7 +358,10 @@ void flex_write_column(lua_State *lua_state, geometry_cache_t *geom_cache,
             throw fmt_error("Invalid type '{}' for int8 column.",
                             lua_typename(lua_state, ltype));
         }
-    } else if (column.type() == table_column_type::real || column.type() == table_column_type::double_precision) {
+        break;
+    }
+    case table_column_type::real:
+    case table_column_type::double_precision: {
         if (ltype == LUA_TNUMBER) {
             copy_mgr->add_column(lua_tonumber(lua_state, -1));
         } else if (ltype == LUA_TSTRING) {
@@ -359,7 +371,9 @@ void flex_write_column(lua_State *lua_state, geometry_cache_t *geom_cache,
             throw fmt_error("Invalid type '{}' for real/double precision column.",
                             lua_typename(lua_state, ltype));
         }
-    } else if (column.type() == table_column_type::timestamp) {
+        break;
+    }
+    case table_column_type::timestamp: {
         if (ltype == LUA_TNUMBER) {
             auto const ts = osmium::Timestamp{lua_tointeger(lua_state, -1)};
             copy_mgr->add_column(ts.to_iso());
@@ -369,7 +383,9 @@ void flex_write_column(lua_State *lua_state, geometry_cache_t *geom_cache,
             throw fmt_error("Invalid type '{}' for timestamp column.",
                             lua_typename(lua_state, ltype));
         }
-    } else if (column.type() == table_column_type::timestamptz) {
+        break;
+    }
+    case table_column_type::timestamptz: {
         if (ltype == LUA_TNUMBER) {
             auto const ts = osmium::Timestamp{lua_tointeger(lua_state, -1)};
             copy_mgr->add_column(ts.to_iso());
@@ -379,7 +395,9 @@ void flex_write_column(lua_State *lua_state, geometry_cache_t *geom_cache,
             throw fmt_error("Invalid type '{}' for timestamptz column.",
                             lua_typename(lua_state, ltype));
         }
-    } else if (column.type() == table_column_type::hstore) {
+        break;
+    }
+    case table_column_type::hstore: {
         if (ltype == LUA_TTABLE) {
             copy_mgr->new_hash();
 
@@ -408,13 +426,17 @@ void flex_write_column(lua_State *lua_state, geometry_cache_t *geom_cache,
             throw fmt_error("Invalid type '{}' for hstore column.",
                             lua_typename(lua_state, ltype));
         }
-    } else if ((column.type() == table_column_type::json) ||
-               (column.type() == table_column_type::jsonb)) {
+        break;
+    }
+    case table_column_type::json:
+    case table_column_type::jsonb: {
         json_writer_t writer;
         table_register_type tables;
         write_json(&writer, lua_state, &tables);
         copy_mgr->add_column(writer.json());
-    } else if (column.type() == table_column_type::direction) {
+        break;
+    }
+    case table_column_type::direction: {
         switch (ltype) {
         case LUA_TBOOLEAN:
             copy_mgr->add_column(lua_toboolean(lua_state, -1));
@@ -430,7 +452,16 @@ void flex_write_column(lua_State *lua_state, geometry_cache_t *geom_cache,
             throw fmt_error("Invalid type '{}' for direction column.",
                             lua_typename(lua_state, ltype));
         }
-    } else if (column.is_geometry_column()) {
+        break;
+    }
+    case table_column_type::geometry:
+    case table_column_type::point:
+    case table_column_type::linestring:
+    case table_column_type::polygon:
+    case table_column_type::multipoint:
+    case table_column_type::multilinestring:
+    case table_column_type::multipolygon:
+    case table_column_type::geometrycollection: {
         if (ltype == LUA_TUSERDATA) {
             auto const *const geom = unpack_geometry(lua_state, -1);
             if (geom && !geom->is_null()) {
@@ -446,12 +477,19 @@ void flex_write_column(lua_State *lua_state, geometry_cache_t *geom_cache,
                      type == table_column_type::multipolygon);
                 if (geom->srid() == column.srid()) {
                     copy_mgr->add_hex_geom(geom_to_ewkb(*geom, wrap_multi));
-                    geom_cache->add_new(&column, *geom);
+                    // The geometry cache is only used for expire, so only
+                    // store the (deep copied) geometry if this column has
+                    // an expire configuration.
+                    if (column.has_expire()) {
+                        geom_cache->add_new(&column, *geom);
+                    }
                 } else {
                     auto const &proj = get_projection(column.srid());
                     auto tgeom = geom::transform(*geom, proj);
                     copy_mgr->add_hex_geom(geom_to_ewkb(tgeom, wrap_multi));
-                    geom_cache->add_new(&column, std::move(tgeom));
+                    if (column.has_expire()) {
+                        geom_cache->add_new(&column, std::move(tgeom));
+                    }
                 }
             } else {
                 write_null(copy_mgr, column);
@@ -460,7 +498,9 @@ void flex_write_column(lua_State *lua_state, geometry_cache_t *geom_cache,
             throw fmt_error("Need geometry data for geometry column '{}'.",
                             column.name());
         }
-    } else {
+        break;
+    }
+    default:
         throw fmt_error("Column type {} not implemented.",
                         static_cast<uint8_t>(column.type()));
     }
