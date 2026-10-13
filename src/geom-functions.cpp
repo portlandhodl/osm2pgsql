@@ -229,6 +229,15 @@ void transform(geometry_t *output, geometry_t const &input,
 {
     assert(input.srid() == PROJ_LATLONG);
 
+    // The "Latlong" projection is the identity projection, so we can simply
+    // copy the geometry. This does not work for geometry collections,
+    // because the transform visitor would reset the SRID of its member
+    // geometries to 0.
+    if (reprojection.target_latlon() && !input.is_collection()) {
+        *output = input;
+        return;
+    }
+
     set_to_same_type(output, input);
     output->set_srid(reprojection.target_srs());
     input.visit(transform_visitor_t{output, &reprojection});
@@ -499,6 +508,7 @@ std::vector<geometry_t> split_multi(geometry_t &&geom, bool split_multi)
     std::vector<geometry_t> output;
 
     if (split_multi && geom.is_multi()) {
+        output.reserve(num_geometries(geom));
         visit(split_visitor_t{&output, geom.srid()}, std::move(geom));
     } else if (!geom.is_null()) {
         output.push_back(std::move(geom));
@@ -530,6 +540,7 @@ void reverse(point_list_t *output, point_list_t const &input)
 void reverse(geom::polygon_t *output, geom::polygon_t const &input)
 {
     reverse(&output->outer(), input.outer());
+    output->inners().reserve(input.inners().size());
     for (auto const &g : input.inners()) {
         reverse(&output->inners().emplace_back(), g);
     }
@@ -633,6 +644,7 @@ void line_merge(geometry_t *output, geometry_t const &input)
     };
 
     std::vector<endpoint_t> endpoints;
+    endpoints.reserve(2 * input.get<multilinestring_t>().num_geometries());
 
     // ...and a list of connections.
     constexpr std::size_t NOCONN = std::numeric_limits<std::size_t>::max();
@@ -647,6 +659,7 @@ void line_merge(geometry_t *output, geometry_t const &input)
     };
 
     std::vector<connection_t> conns;
+    conns.reserve(input.get<multilinestring_t>().num_geometries());
 
     // Initialize the two lists.
     for (auto const &line : input.get<multilinestring_t>()) {
@@ -686,6 +699,7 @@ void line_merge(geometry_t *output, geometry_t const &input)
         }
 
         linestring_t linestring;
+        linestring.reserve(input.get<multilinestring_t>().n_points());
         {
             std::size_t prev = NOCONN;
             std::size_t cur = i;
@@ -727,6 +741,7 @@ void line_merge(geometry_t *output, geometry_t const &input)
             }
 
             linestring_t linestring;
+            linestring.reserve(input.get<multilinestring_t>().n_points());
             {
                 std::size_t prev = conns[i].left;
                 std::size_t cur = i;
@@ -853,6 +868,7 @@ bool simplify(linestring_t *output, linestring_t const &input, double tolerance)
 bool simplify(multilinestring_t *output, multilinestring_t const &input,
               double tolerance)
 {
+    output->reserve(input.num_geometries());
     for (auto const &linestring : input) {
         linestring_t simplified_ls;
         if (simplify(&simplified_ls, linestring, tolerance)) {
