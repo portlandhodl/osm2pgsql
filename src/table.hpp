@@ -20,6 +20,7 @@
 #include <cstddef>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -81,6 +82,23 @@ private:
     hstores_t m_hstore_columns;
     std::string m_table_space;
     task_result_t m_task_result;
+
+    /// Maps each column name to the indexes of the columns with that name.
+    std::unordered_map<std::string, std::vector<std::size_t>> m_column_map;
+
+    /* The following members are scratch space reused for each row to
+       avoid memory allocations. Their contents are only valid inside
+       write_row(). */
+
+    /// Pointers to the values of the tags matching a column, by column.
+    std::vector<std::string const *> m_column_values;
+
+    /// Flags which tags have already been used for a regular column.
+    std::vector<bool> m_used;
+
+    /// Collected key/value pairs for each of the hstore columns.
+    std::vector<std::vector<std::pair<char const *, char const *>>>
+        m_hstore_elements;
 
     db_copy_mgr_t<db_deleter_by_id_t> m_copy;
 };

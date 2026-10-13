@@ -38,6 +38,13 @@ table_t::table_t(std::string const &name, std::string type, columns_t columns,
         throw fmt_error("No columns provided for table {}.", name);
     }
 
+    // Build the lookup structures used by write_row() once, so that
+    // the columns don't have to search the tag list for each row.
+    for (std::size_t i = 0; i < m_columns.size(); ++i) {
+        m_column_map[m_columns[i].name].push_back(i);
+    }
+    m_hstore_elements.resize(m_hstore_columns.size());
+
     generate_copy_column_list();
 }
 
@@ -49,6 +56,13 @@ table_t::table_t(table_t const &other,
   m_hstore_columns(other.m_hstore_columns), m_table_space(other.m_table_space),
   m_copy(copy_thread)
 {
+    // Build the lookup structures used by write_row() once, so that
+    // the columns don't have to search the tag list for each row.
+    for (std::size_t i = 0; i < m_columns.size(); ++i) {
+        m_column_map[m_columns[i].name].push_back(i);
+    }
+    m_hstore_elements.resize(m_hstore_columns.size());
+
     // if the other table has already started, then we want to execute
     // the same stuff to get into the same state. but if it hasn't, then
     // this would be premature.
@@ -249,21 +263,20 @@ void table_t::write_row(osmid_t id, taglist_t const &tags,
     m_copy.add_column(id);
 
     // used to remember which columns have been written out already.
-    std::vector<bool> used;
-
     if (m_hstore_mode != hstore_column::none) {
-        used.assign(tags.size(), false);
+        m_used.assign(tags.size(), false);
     }
 
     //get the regular columns' values
-    write_columns(tags, m_hstore_mode == hstore_column::norm ? &used : nullptr);
+    write_columns(tags,
+                  m_hstore_mode == hstore_column::norm ? &m_used : nullptr);
 
     //get the hstore columns' values
     write_hstore_columns(tags);
 
     //get the key value pairs for the tags column
     if (m_hstore_mode != hstore_column::none) {
-        write_tags_column(tags, used);
+        write_tags_column(tags, m_used);
     }
 
     //add the geometry - encoding it to hex along the way
@@ -275,16 +288,34 @@ void table_t::write_row(osmid_t id, taglist_t const &tags,
 
 void table_t::write_columns(taglist_t const &tags, std::vector<bool> *used)
 {
-    for (auto const &column : m_columns) {
-        std::size_t const idx = tags.indexof(column.name);
-        if (idx != std::numeric_limits<std::size_t>::max()) {
-            escape_type(tags[idx].value, column.type);
+    /* Find the values of all columns in a single pass over the tags.
+       Like taglist_t::indexof() the first tag with a given key wins. */
+    m_column_values.assign(m_columns.size(), nullptr);
 
-            // Remember we already used this one so we can't use
-            // again later in the hstore column.
-            if (used) {
-                (*used)[idx] = true;
+    for (std::size_t i = 0; i < tags.size(); ++i) {
+        auto const it = m_column_map.find(tags[i].key);
+        if (it == m_column_map.end()) {
+            continue;
+        }
+
+        bool is_first_tag_for_column = false;
+        for (auto const column_idx : it->second) {
+            if (m_column_values[column_idx] == nullptr) {
+                m_column_values[column_idx] = &tags[i].value;
+                is_first_tag_for_column = true;
             }
+        }
+
+        // Remember we already used this one so we can't use
+        // again later in the hstore column.
+        if (is_first_tag_for_column && used) {
+            (*used)[i] = true;
+        }
+    }
+
+    for (std::size_t i = 0; i < m_columns.size(); ++i) {
+        if (m_column_values[i] != nullptr) {
+            escape_type(*m_column_values[i], m_columns[i].type);
         } else {
             m_copy.add_null_column();
         }
@@ -310,29 +341,37 @@ void table_t::write_tags_column(taglist_t const &tags,
 /* write an hstore column to the database */
 void table_t::write_hstore_columns(taglist_t const &tags)
 {
-    for (auto const &hcolumn : m_hstore_columns) {
-        bool added = false;
+    /* Collect the key/value pairs of all hstore columns in a single pass
+       over the tags. The pairs are buffered because each hash column
+       must be written contiguously. The pointers point into the tag
+       storage which stays valid for the duration of write_row(). */
+    for (auto &elements : m_hstore_elements) {
+        elements.clear();
+    }
 
-        for (auto const &tag : tags) {
+    for (auto const &tag : tags) {
+        for (std::size_t i = 0; i < m_hstore_columns.size(); ++i) {
+            auto const &hcolumn = m_hstore_columns[i];
             //check if the tag's key starts with the name of the hstore column
             if (tag.key.compare(0, hcolumn.size(), hcolumn) == 0) {
-                char const *const shortkey = &tag.key[hcolumn.size()];
+                char const *const shortkey = tag.key.c_str() + hcolumn.size();
 
                 //and pack the shortkey with its value into the hstore
                 //hstore ASCII representation looks like "key"=>"value"
-                if (!added) {
-                    added = true;
-                    m_copy.new_hash();
-                }
-
-                m_copy.add_hash_elem(shortkey, tag.value.c_str());
+                m_hstore_elements[i].emplace_back(shortkey, tag.value.c_str());
             }
         }
+    }
 
-        if (added) {
-            m_copy.finish_hash();
-        } else {
+    for (auto const &elements : m_hstore_elements) {
+        if (elements.empty()) {
             m_copy.add_null_column();
+        } else {
+            m_copy.new_hash();
+            for (auto const &element : elements) {
+                m_copy.add_hash_elem(element.first, element.second);
+            }
+            m_copy.finish_hash();
         }
     }
 }
@@ -385,22 +424,33 @@ void table_t::escape_type(std::string const &value, column_type_t flags)
          * reject anything else
          */
         {
-            std::string escaped{value};
-            std::replace(escaped.begin(), escaped.end(), ',', '.');
-
             double from = NAN;
             double to = NAN;
-            int const items =
-                std::sscanf(escaped.c_str(), "%lf-%lf", &from, &to);
+            int items = 0;
+            bool has_ft_suffix = false;
+
+            /* The escaped copy with ',' replaced by '.' is only needed
+               if there actually is a ',' in the value. */
+            if (value.find(',') == std::string::npos) {
+                items = std::sscanf(value.c_str(), "%lf-%lf", &from, &to);
+                has_ft_suffix = value.size() > 1 &&
+                                value.compare(value.size() - 2, 2, "ft") == 0;
+            } else {
+                std::string escaped{value};
+                std::replace(escaped.begin(), escaped.end(), ',', '.');
+                items = std::sscanf(escaped.c_str(), "%lf-%lf", &from, &to);
+                has_ft_suffix =
+                    escaped.size() > 1 &&
+                    escaped.compare(escaped.size() - 2, 2, "ft") == 0;
+            }
+
             if (items == 1) {
-                if (escaped.size() > 1 &&
-                    escaped.substr(escaped.size() - 2) == "ft") {
+                if (has_ft_suffix) {
                     from *= 0.3048;
                 }
                 m_copy.add_column(from);
             } else if (items == 2) {
-                if (escaped.size() > 1 &&
-                    escaped.substr(escaped.size() - 2) == "ft") {
+                if (has_ft_suffix) {
                     from *= 0.3048;
                     to *= 0.3048;
                 }
