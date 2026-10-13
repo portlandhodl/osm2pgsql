@@ -40,6 +40,7 @@
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
+#include <future>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -1552,12 +1553,33 @@ void output_flex_t::reprocess_marked()
     if (!get_options()->append) {
         util::timer_t timer;
 
+        std::vector<std::future<std::chrono::microseconds>> index_tasks;
+
         for (auto &table : m_table_connections) {
             if (table.table().matches_type(osmium::item_type::way) &&
                 table.table().has_id_column()) {
-                table.table().analyze(m_db_connection);
-                table.create_id_index(m_db_connection);
+                index_tasks.push_back(thread_pool().submit([&]() {
+                    pg_conn_t const db_connection{
+                        get_options()->connection_params, "out.flex.index"};
+                    table.table().analyze(db_connection);
+                    table.create_id_index(db_connection);
+                }));
             }
+        }
+
+        std::exception_ptr eptr;
+        for (auto &task : index_tasks) {
+            try {
+                task.get();
+            } catch (...) {
+                if (!eptr) {
+                    eptr = std::current_exception();
+                }
+            }
+        }
+
+        if (eptr) {
+            std::rethrow_exception(eptr);
         }
 
         log_info("Creating id indexes took {}",
