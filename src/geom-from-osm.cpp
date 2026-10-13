@@ -71,12 +71,16 @@ void fill_polygon(polygon_t *polygon, osmium::Area const &area,
 {
     assert(polygon->inners().empty());
 
+    polygon->outer().reserve(outer_ring.size());
     for (auto const &nr : outer_ring) {
         polygon->outer().emplace_back(nr.location());
     }
 
-    for (auto const &inner_ring : area.inner_rings(outer_ring)) {
+    auto const inner_rings = area.inner_rings(outer_ring);
+    polygon->inners().reserve(inner_rings.size());
+    for (auto const &inner_ring : inner_rings) {
         auto &ring = polygon->inners().emplace_back();
+        ring.reserve(inner_ring.size());
         for (auto const &nr : inner_ring) {
             ring.emplace_back(nr.location());
         }
@@ -145,6 +149,7 @@ void create_multipoint(geometry_t *geom, osmium::memory::Buffer const &buffer)
         }
     } else {
         auto &multipoint = geom->set<multipoint_t>();
+        multipoint.reserve(nodes.size());
         for (auto const &node : nodes) {
             auto const location = node.location();
             if (location.valid()) {
@@ -185,6 +190,7 @@ void create_multilinestring(geometry_t *geom,
         }
     } else {
         auto &multiline = geom->set<multilinestring_t>();
+        multiline.reserve(ways.size());
         for (auto const &way : ways) {
             linestring_t line;
             if (fill_point_list(&line, way.nodes())) {
@@ -231,6 +237,7 @@ void create_multipolygon(geometry_t *geom, osmium::Relation const &relation,
 
     if (area.is_multipolygon()) {
         auto &multipolygon = geom->set<multipolygon_t>();
+        multipolygon.reserve(area.num_rings().first);
 
         for (auto const &outer : area.outer_rings()) {
             auto &polygon = multipolygon.add_geometry();
