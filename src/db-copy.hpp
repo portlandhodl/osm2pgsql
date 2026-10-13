@@ -173,7 +173,12 @@ struct db_cmd_copy_t
     db_cmd_copy_t() = default;
 
     explicit db_cmd_copy_t(std::shared_ptr<db_target_descr_t> t)
-    : target(std::move(t))
+    : db_cmd_copy_t(std::move(t), std::string{})
+    {
+    }
+
+    db_cmd_copy_t(std::shared_ptr<db_target_descr_t> t, std::string &&buf)
+    : target(std::move(t)), buffer(std::move(buf))
     {
         buffer.reserve(MAX_BUF_SIZE);
     }
@@ -258,6 +263,15 @@ public:
     /// Add a command to the worker queue.
     void send_command(db_cmd_t &&buffer);
 
+    /**
+     * Acquire a buffer for a new copy command.
+     *
+     * Returns either a recycled buffer (with its large capacity kept)
+     * from the free list or an empty string which the caller must
+     * reserve appropriately.
+     */
+    std::string acquire_buffer();
+
     /// Close COPY if one is open.
     void end_copy();
 
@@ -279,6 +293,8 @@ private:
         std::condition_variable queue_cond;
         std::condition_variable queue_full_cond;
         std::deque<db_cmd_t> worker_queue;
+        /// Recycled copy buffers (guarded by queue_mutex like the queue).
+        std::deque<std::string> free_buffers;
     };
 
     // This is the class that actually instantiated and run in the thread.
@@ -298,6 +314,15 @@ private:
         bool execute(db_cmd_sync_t &cmd);
 
         static bool execute(db_cmd_finish_t &) { return true; }
+
+        /**
+         * Recycle a used copy buffer by moving it onto the free list.
+         *
+         * If the free list plus the worker queue already hold
+         * MAX_BUFFERS buffers, the buffer is destroyed instead to
+         * keep the total number of copy buffers limited.
+         */
+        void recycle_buffer(std::string &&buffer);
 
         void start_copy(std::shared_ptr<db_target_descr_t> const &target);
         void finish_copy();

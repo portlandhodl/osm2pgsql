@@ -125,7 +125,47 @@ void db_copy_thread_t::finish()
     if (m_worker.joinable()) {
         send_command(db_cmd_finish_t{});
         m_worker.join();
+        // The worker thread has finished, nothing can access the free
+        // list any more. Free the recycled buffers so that they are
+        // destroyed here and not kept around forever.
+        m_shared.free_buffers.clear();
     }
+}
+
+std::string db_copy_thread_t::acquire_buffer()
+{
+    std::unique_lock<std::mutex> lock{m_shared.queue_mutex};
+
+    if (m_shared.free_buffers.empty()) {
+        return {};
+    }
+
+    std::string buffer = std::move(m_shared.free_buffers.front());
+    m_shared.free_buffers.pop_front();
+    return buffer;
+}
+
+void db_copy_thread_t::thread_t::recycle_buffer(std::string &&buffer)
+{
+    std::unique_lock<std::mutex> lock{m_shared->queue_mutex};
+
+    // Keep the number of copy buffers in existence limited: buffers on
+    // the free list count against the same limit as buffers queued for
+    // the worker thread.
+    if (m_shared->free_buffers.size() + m_shared->worker_queue.size() >=
+        db_cmd_copy_t::MAX_BUFFERS) {
+        return; // do not recycle, let the buffer be destroyed
+    }
+
+    // A buffer that was grown beyond the usual size (by a single huge
+    // row) is not recycled, so that the free list does not keep those
+    // oversized buffers around forever.
+    if (buffer.capacity() > db_cmd_copy_t::MAX_BUF_SIZE) {
+        return; // do not recycle, let the buffer be destroyed
+    }
+
+    buffer.clear();
+    m_shared->free_buffers.push_back(std::move(buffer));
 }
 
 db_copy_thread_t::thread_t::thread_t(pg_conn_t &&db_connection,
@@ -186,6 +226,8 @@ bool db_copy_thread_t::thread_t::execute(db_cmd_copy_delete_t<DELETER> &cmd)
     }
 
     m_db_connection.copy_send(cmd.buffer, cmd.target->name());
+
+    recycle_buffer(std::move(cmd.buffer));
 
     return false;
 }
